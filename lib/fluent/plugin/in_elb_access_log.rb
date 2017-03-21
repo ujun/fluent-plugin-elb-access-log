@@ -1,4 +1,5 @@
 require 'fluent_plugin_elb_access_log/version'
+require 'fluent/input'
 
 class Fluent::ElbAccessLogInput < Fluent::Input
   Fluent::Plugin.register_input('elb_access_log', self)
@@ -7,12 +8,13 @@ class Fluent::ElbAccessLogInput < Fluent::Input
 
   # http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/access-log-collection.html#access-log-entry-format
   ACCESS_LOG_FIELDS = {
+    'type'                     => nil,
     'timestamp'                => nil,
     'elb'                      => nil,
     'client_port'              => nil,
-    'backend_port'             => nil,
+    'target_port'              => nil,
     'request_processing_time'  => :to_f,
-    'backend_processing_time'  => :to_f,
+    'target_processing_time'   => :to_f,
     'response_processing_time' => :to_f,
     'elb_status_code'          => :to_i,
     'backend_status_code'      => :to_i,
@@ -22,6 +24,7 @@ class Fluent::ElbAccessLogInput < Fluent::Input
     'user_agent'               => nil,
     'ssl_cipher'               => nil,
     'ssl_protocol'             => nil,
+    'target_group_arn'         => nil,
   }
 
   unless method_defined?(:log)
@@ -59,6 +62,7 @@ class Fluent::ElbAccessLogInput < Fluent::Input
     require 'time'
     require 'addressable/uri'
     require 'aws-sdk'
+    require 'multiple_files_gzip_reader'
   end
 
   def configure(conf)
@@ -132,13 +136,12 @@ class Fluent::ElbAccessLogInput < Fluent::Input
           account_id, logfile_const, region, elb_name, logfile_datetime, ip, logfile_suffix = obj.key.split('_', 7)
           logfile_datetime = Time.parse(logfile_datetime)
 
-          if logfile_suffix !~ /\.log\z/ or logfile_datetime <= (timestamp - @buffer_sec)
+          if logfile_suffix !~ /\.gz\z/ or logfile_datetime <= (timestamp - @buffer_sec)
             next
           end
 
           unless @history.include?(obj.key)
-            access_log = client.get_object(bucket: @s3_bucket, key: obj.key).body.string
-            emit_access_log(access_log)
+            emit_access_log(decompress_access_log(obj.key))
             last_timestamp = logfile_datetime
             @history.push(obj.key)
           end
@@ -147,6 +150,13 @@ class Fluent::ElbAccessLogInput < Fluent::Input
     end
 
     last_timestamp
+  end
+
+  def decompress_access_log(obj_key)
+      file = client.get_object(bucket: @s3_bucket, key: obj_key)
+      access_log = MultipleFilesGzipReader.new(file.body).read
+
+      access_log
   end
 
   def prefixes(timestamp)
@@ -178,7 +188,7 @@ class Fluent::ElbAccessLogInput < Fluent::Input
       end
 
       split_address_port!(record, 'client')
-      split_address_port!(record, 'backend')
+      split_address_port!(record, 'target')
 
       parse_request!(record)
 
@@ -194,18 +204,19 @@ class Fluent::ElbAccessLogInput < Fluent::Input
       parsed = CSV.parse_line(line, :col_sep => ' ')
     rescue => e
       begin
-        parsed = line.split(' ', 12)
+        parsed = line.split(' ', 13)
 
         # request
-        parsed[11] ||= ''
-        parsed[11].sub!(/\A"/, '')
-        parsed[11].sub!(/"(.*)\z/, '')
+        parsed[12] ||= ''
+        parsed[12].sub!(/\A"/, '')
+        parsed[12].sub!(/"(.*)\z/, '')
 
-        user_agent, ssl_cipher, ssl_protocol = $1.strip.split(' ', 3)
+        user_agent, ssl_cipher, ssl_protocol, target_group_arn = $1.strip.split(' ', 4)
         user_agent.sub!(/\A"/, '').sub!(/"\z/, '') if user_agent
-        parsed[12] = user_agent
-        parsed[13] = ssl_cipher
-        parsed[14] = ssl_protocol
+        parsed[13] = user_agent
+        parsed[14] = ssl_cipher
+        parsed[15] = ssl_protocol
+        parsed[16] = target_group_arn
       rescue => e2
         @log.warn("#{e.message}: #{line}")
       end
@@ -311,3 +322,4 @@ class Fluent::ElbAccessLogInput < Fluent::Input
     end
   end # TimerWatcher
 end # Fluent::ElbAccessLogInput
+
